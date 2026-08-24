@@ -1,4 +1,5 @@
 import os
+from io import StringIO
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -20,30 +21,34 @@ except ImportError:
 # ============================================================
 
 st.set_page_config(
-    page_title="Institutional Market Dashboard",
+    page_title="Market Dashboard",
     page_icon="📊",
     layout="wide",
 )
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIGURATION AND API KEYS
 # ============================================================
 
-MASSIVE_API_KEY = os.getenv("MASSIVE_API_KEY", "")
-GOLDAPI_KEY = os.getenv("GOLDAPI_KEY", "")
+def read_secret(name: str) -> str:
+    """
+    Reads a secret from Streamlit Cloud Secrets first,
+    then from environment variables.
+    """
+    try:
+        value = st.secrets[name]
+    except Exception:
+        value = os.getenv(name, "")
 
-try:
-    if not MASSIVE_API_KEY:
-        MASSIVE_API_KEY = st.secrets.get("MASSIVE_API_KEY", "")
-
-    if not GOLDAPI_KEY:
-        GOLDAPI_KEY = st.secrets.get("GOLDAPI_KEY", "")
-except Exception:
-    pass
+    return str(value or "").strip().strip('"').strip("'")
 
 
-MASSIVE_BASE_URL = "https://api.polygon.io"
+MASSIVE_API_KEY = read_secret("MASSIVE_API_KEY")
+GOLDAPI_KEY = read_secret("GOLDAPI_KEY")
+
+# Current Massive API base URL
+MASSIVE_BASE_URL = "https://api.massive.com"
 
 
 # ============================================================
@@ -51,10 +56,35 @@ MASSIVE_BASE_URL = "https://api.polygon.io"
 # ============================================================
 
 def clean_symbol(symbol: str) -> str:
-    return symbol.strip().upper()
+    return str(symbol).strip().upper()
+
+
+def safe_float(value, default=np.nan):
+    try:
+        result = float(value)
+
+        if np.isfinite(result):
+            return result
+
+        return default
+
+    except Exception:
+        return default
+
+
+def format_percent(value) -> str:
+    value = safe_float(value)
+
+    if np.isfinite(value):
+        return f"{value:+.2f}%"
+
+    return "Unavailable"
 
 
 def yfinance_symbol(symbol: str) -> str:
+    """
+    Converts friendly metal names into Yahoo Finance symbols.
+    """
     mapping = {
         "GOLD": "GC=F",
         "XAU": "GC=F",
@@ -63,80 +93,109 @@ def yfinance_symbol(symbol: str) -> str:
         "XAG": "SI=F",
         "XAGUSD": "SI=F",
     }
+
     return mapping.get(symbol, symbol)
 
 
 def is_precious_metal_spot(symbol: str) -> bool:
-    return symbol in {"GOLD", "XAU", "XAUUSD", "SILVER", "XAG", "XAGUSD"}
+    return symbol in {
+        "GOLD",
+        "XAU",
+        "XAUUSD",
+        "SILVER",
+        "XAG",
+        "XAGUSD",
+    }
 
 
 def metal_code(symbol: str) -> str:
     if symbol in {"GOLD", "XAU", "XAUUSD"}:
         return "XAU"
+
     return "XAG"
 
 
-def safe_float(value, default=np.nan):
-    try:
-        result = float(value)
-        return result if np.isfinite(result) else default
-    except Exception:
-        return default
+def normalize_yfinance_columns(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Makes yfinance columns consistent when yfinance returns
+    normal columns or MultiIndex columns.
+    """
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+
+    data.columns = [
+        str(column).lower().replace(" ", "_")
+        for column in data.columns
+    ]
+
+    return data
 
 
 # ============================================================
-# MASSIVE / POLYGON DATA
+# MASSIVE DATA
 # ============================================================
 
 @st.cache_data(ttl=15, show_spinner=False)
-def massive_latest_quote(symbol: str):
-    if not MASSIVE_API_KEY:
+def massive_latest_quote(symbol: str, api_key: str):
+    """
+    Gets the latest U.S. stock or ETF snapshot from Massive.
+    """
+    if not api_key:
         return None
 
     symbol = clean_symbol(symbol)
 
-    url = f"{MASSIVE_BASE_URL}/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}"
+    url = (
+        f"{MASSIVE_BASE_URL}/v2/snapshot/locale/us/"
+        f"markets/stocks/tickers/{symbol}"
+    )
 
     try:
         response = requests.get(
             url,
-            params={"apiKey": MASSIVE_API_KEY},
-            timeout=15,
+            params={"apiKey": api_key},
+            timeout=20,
         )
-        response.raise_for_status()
-        payload = response.json()
-        ticker = payload.get("ticker", {})
 
-        last_trade = ticker.get("lastTrade", {})
-        day_data = ticker.get("day", {})
-        previous_day = ticker.get("prevDay", {})
+        if response.status_code != 200:
+            return None
+
+        payload = response.json()
+        ticker = payload.get("ticker") or {}
+
+        last_trade = ticker.get("lastTrade") or {}
+        last_quote = ticker.get("lastQuote") or {}
+        day_data = ticker.get("day") or {}
+        previous_day = ticker.get("prevDay") or {}
 
         price = (
             last_trade.get("p")
             or day_data.get("c")
-            or ticker.get("lastQuote", {}).get("P")
+            or last_quote.get("P")
+            or last_quote.get("p")
         )
 
         previous_close = previous_day.get("c")
+
         price = safe_float(price)
         previous_close = safe_float(previous_close)
 
         if not np.isfinite(price):
             return None
 
-        change = np.nan
-        change_percent = np.nan
-
         if np.isfinite(previous_close) and previous_close != 0:
             change = price - previous_close
             change_percent = change / previous_close * 100
+        else:
+            change = np.nan
+            change_percent = np.nan
 
         return {
             "price": price,
             "previous_close": previous_close,
             "change": change,
             "change_percent": change_percent,
-            "source": "Massive real-time snapshot",
+            "source": "Massive",
             "delayed": False,
             "timestamp": datetime.now(timezone.utc),
         }
@@ -146,8 +205,15 @@ def massive_latest_quote(symbol: str):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def massive_daily_history(symbol: str, years: int = 3):
-    if not MASSIVE_API_KEY:
+def massive_daily_history(
+    symbol: str,
+    years: int,
+    api_key: str,
+):
+    """
+    Gets daily historical candles from Massive.
+    """
+    if not api_key:
         return None
 
     symbol = clean_symbol(symbol)
@@ -167,13 +233,16 @@ def massive_daily_history(symbol: str, years: int = 3):
                 "adjusted": "true",
                 "sort": "asc",
                 "limit": 50000,
-                "apiKey": MASSIVE_API_KEY,
+                "apiKey": api_key,
             },
             timeout=30,
         )
-        response.raise_for_status()
 
-        results = response.json().get("results", [])
+        if response.status_code != 200:
+            return None
+
+        payload = response.json()
+        results = payload.get("results") or []
 
         if not results:
             return None
@@ -183,7 +252,11 @@ def massive_daily_history(symbol: str, years: int = 3):
         for item in results:
             rows.append(
                 {
-                    "date": pd.to_datetime(item["t"], unit="ms"),
+                    "date": pd.to_datetime(
+                        item.get("t"),
+                        unit="ms",
+                        errors="coerce",
+                    ),
                     "open": safe_float(item.get("o")),
                     "high": safe_float(item.get("h")),
                     "low": safe_float(item.get("l")),
@@ -193,7 +266,17 @@ def massive_daily_history(symbol: str, years: int = 3):
             )
 
         dataframe = pd.DataFrame(rows)
+
+        if dataframe.empty:
+            return None
+
+        dataframe = dataframe.dropna(
+            subset=["date", "open", "high", "low", "close"]
+        )
+
         dataframe = dataframe.set_index("date")
+        dataframe = dataframe.sort_index()
+
         return dataframe
 
     except Exception:
@@ -201,30 +284,44 @@ def massive_daily_history(symbol: str, years: int = 3):
 
 
 # ============================================================
-# GOLDAPI SPOT DATA
+# GOLDAPI DATA
 # ============================================================
 
 @st.cache_data(ttl=15, show_spinner=False)
-def goldapi_latest_quote(symbol: str):
-    if not GOLDAPI_KEY:
+def goldapi_latest_quote(symbol: str, api_key: str):
+    """
+    Gets current gold or silver spot prices from GoldAPI.
+
+    Gold:
+        XAU/USD
+
+    Silver:
+        XAG/USD
+    """
+    if not api_key:
         return None
 
     code = metal_code(symbol)
+
     url = f"https://app.goldapi.net/price/{code}/USD"
 
     try:
         response = requests.get(
             url,
-            headers={"x-api-key": GOLDAPI_KEY},
-            params={"x-api-key": GOLDAPI_KEY},
-            timeout=15,
+            params={"x-api-key": api_key},
+            timeout=20,
         )
-        response.raise_for_status()
+
+        if response.status_code != 200:
+            return None
+
         payload = response.json()
 
         price = safe_float(payload.get("price"))
+
         previous_close = safe_float(
-            payload.get("prev_close") or payload.get("previous_close")
+            payload.get("prev_close")
+            or payload.get("previous_close")
         )
 
         if not np.isfinite(price):
@@ -236,8 +333,9 @@ def goldapi_latest_quote(symbol: str):
         if not np.isfinite(change) and np.isfinite(previous_close):
             change = price - previous_close
 
-        if not np.isfinite(change_percent) and np.isfinite(previous_close):
-            change_percent = change / previous_close * 100
+        if not np.isfinite(change_percent):
+            if np.isfinite(previous_close) and previous_close != 0:
+                change_percent = change / previous_close * 100
 
         return {
             "price": price,
@@ -254,11 +352,15 @@ def goldapi_latest_quote(symbol: str):
 
 
 # ============================================================
-# YFINANCE FALLBACK DATA
+# YAHOO FINANCE FALLBACK DATA
 # ============================================================
 
 @st.cache_data(ttl=60, show_spinner=False)
 def yfinance_history(symbol: str, years: int = 3):
+    """
+    Fallback historical data source.
+    Data can be delayed.
+    """
     yf_symbol = yfinance_symbol(symbol)
 
     try:
@@ -274,29 +376,31 @@ def yfinance_history(symbol: str, years: int = 3):
         if data is None or data.empty:
             return None
 
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
+        data = normalize_yfinance_columns(data)
 
-        data.columns = [
-            str(column).lower().replace(" ", "_")
-            for column in data.columns
+        required_columns = [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
         ]
 
-        rename_map = {
-            "adj_close": "adjclose",
-        }
-
-        data = data.rename(columns=rename_map)
-
-        required = ["open", "high", "low", "close", "volume"]
-
-        for column in required:
+        for column in required_columns:
             if column not in data.columns:
                 return None
 
-        data = data[required].copy()
+        data = data[required_columns].copy()
         data.index = pd.to_datetime(data.index)
-        data = data.dropna(subset=["open", "high", "low", "close"])
+
+        data = data.dropna(
+            subset=["open", "high", "low", "close"]
+        )
+
+        data = data.sort_index()
+
+        if data.empty:
+            return None
 
         return data
 
@@ -306,6 +410,10 @@ def yfinance_history(symbol: str, years: int = 3):
 
 @st.cache_data(ttl=30, show_spinner=False)
 def yfinance_latest_quote(symbol: str):
+    """
+    Fallback latest quote.
+    This data may be delayed.
+    """
     yf_symbol = yfinance_symbol(symbol)
 
     try:
@@ -321,28 +429,33 @@ def yfinance_latest_quote(symbol: str):
         if data is None or data.empty:
             return None
 
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
+        data = normalize_yfinance_columns(data)
 
-        data.columns = [str(c).lower() for c in data.columns]
+        if "close" not in data.columns:
+            return None
+
         data = data.dropna(subset=["close"])
 
-        if len(data) == 0:
+        if data.empty:
             return None
 
         price = safe_float(data["close"].iloc[-1])
-        previous_close = (
-            safe_float(data["close"].iloc[-2])
-            if len(data) > 1
-            else np.nan
-        )
 
-        change = price - previous_close
-        change_percent = (
-            change / previous_close * 100
-            if np.isfinite(previous_close) and previous_close != 0
-            else np.nan
-        )
+        if len(data) > 1:
+            previous_close = safe_float(data["close"].iloc[-2])
+        else:
+            previous_close = np.nan
+
+        if (
+            np.isfinite(price)
+            and np.isfinite(previous_close)
+            and previous_close != 0
+        ):
+            change = price - previous_close
+            change_percent = change / previous_close * 100
+        else:
+            change = np.nan
+            change_percent = np.nan
 
         return {
             "price": price,
@@ -365,27 +478,39 @@ def yfinance_latest_quote(symbol: str):
 def load_quote(symbol: str):
     symbol = clean_symbol(symbol)
 
+    # GoldAPI is used for gold/silver spot prices
     if is_precious_metal_spot(symbol):
-        quote = goldapi_latest_quote(symbol)
+        quote = goldapi_latest_quote(symbol, GOLDAPI_KEY)
+
         if quote is not None:
             return quote
 
-    quote = massive_latest_quote(symbol)
+    # Massive is used for U.S. stocks and ETFs
+    quote = massive_latest_quote(symbol, MASSIVE_API_KEY)
+
     if quote is not None:
         return quote
 
+    # Fallback
     return yfinance_latest_quote(symbol)
 
 
 def load_history(symbol: str):
     symbol = clean_symbol(symbol)
 
+    # Massive historical data for U.S. stocks and ETFs
     if not is_precious_metal_spot(symbol):
-        data = massive_daily_history(symbol)
+        data = massive_daily_history(
+            symbol,
+            years=3,
+            api_key=MASSIVE_API_KEY,
+        )
+
         if data is not None and not data.empty:
             return data
 
-    return yfinance_history(symbol)
+    # Fallback history, including gold and silver futures
+    return yfinance_history(symbol, years=3)
 
 
 # ============================================================
@@ -395,29 +520,75 @@ def load_history(symbol: str):
 def calculate_indicators(data: pd.DataFrame) -> pd.DataFrame:
     df = data.copy()
 
-    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
+    # Moving averages
+    df["ema21"] = df["close"].ewm(
+        span=21,
+        adjust=False,
+    ).mean()
 
+    df["ema50"] = df["close"].ewm(
+        span=50,
+        adjust=False,
+    ).mean()
+
+    df["ema200"] = df["close"].ewm(
+        span=200,
+        adjust=False,
+    ).mean()
+
+    # RSI
     delta = df["close"].diff()
+
     gains = delta.clip(lower=0)
     losses = -delta.clip(upper=0)
 
-    average_gain = gains.ewm(alpha=1 / 14, adjust=False).mean()
-    average_loss = losses.ewm(alpha=1 / 14, adjust=False).mean()
+    average_gain = gains.ewm(
+        alpha=1 / 14,
+        adjust=False,
+    ).mean()
 
-    relative_strength = average_gain / average_loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + relative_strength))
-    df["rsi"] = df["rsi"].fillna(50)
+    average_loss = losses.ewm(
+        alpha=1 / 14,
+        adjust=False,
+    ).mean()
 
-    df["macd"] = (
-        df["close"].ewm(span=12, adjust=False).mean()
-        - df["close"].ewm(span=26, adjust=False).mean()
+    relative_strength = (
+        average_gain
+        / average_loss.replace(0, np.nan)
     )
 
-    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["macd_histogram"] = df["macd"] - df["macd_signal"]
+    df["rsi"] = 100 - (
+        100 / (1 + relative_strength)
+    )
 
+    df["rsi"] = df["rsi"].replace(
+        [np.inf, -np.inf],
+        np.nan,
+    ).fillna(50)
+
+    # MACD
+    fast_ema = df["close"].ewm(
+        span=12,
+        adjust=False,
+    ).mean()
+
+    slow_ema = df["close"].ewm(
+        span=26,
+        adjust=False,
+    ).mean()
+
+    df["macd"] = fast_ema - slow_ema
+
+    df["macd_signal"] = df["macd"].ewm(
+        span=9,
+        adjust=False,
+    ).mean()
+
+    df["macd_histogram"] = (
+        df["macd"] - df["macd_signal"]
+    )
+
+    # ATR
     previous_close = df["close"].shift(1)
 
     true_range = pd.concat(
@@ -429,25 +600,44 @@ def calculate_indicators(data: pd.DataFrame) -> pd.DataFrame:
         axis=1,
     ).max(axis=1)
 
-    df["atr"] = true_range.ewm(alpha=1 / 14, adjust=False).mean()
+    df["atr"] = true_range.ewm(
+        alpha=1 / 14,
+        adjust=False,
+    ).mean()
 
+    # Volume
     df["volume_average"] = df["volume"].rolling(20).mean()
+
     df["volume_ratio"] = (
-        df["volume"] / df["volume_average"].replace(0, np.nan)
+        df["volume"]
+        / df["volume_average"].replace(0, np.nan)
     )
 
+    # Trend score
     df["trend_score"] = (
         (df["close"] > df["ema21"]).astype(int)
         + (df["close"] > df["ema50"]).astype(int)
         + (df["close"] > df["ema200"]).astype(int)
     )
 
-    df["recent_high"] = df["high"].rolling(20).max().shift(1)
-    df["recent_low"] = df["low"].rolling(20).min().shift(1)
+    # Breakout structure
+    df["recent_high"] = (
+        df["high"].rolling(20).max().shift(1)
+    )
 
-    df["bullish_bos"] = df["close"] > df["recent_high"]
-    df["bearish_bos"] = df["close"] < df["recent_low"]
+    df["recent_low"] = (
+        df["low"].rolling(20).min().shift(1)
+    )
 
+    df["bullish_bos"] = (
+        df["close"] > df["recent_high"]
+    )
+
+    df["bearish_bos"] = (
+        df["close"] < df["recent_low"]
+    )
+
+    # Buy and sell conditions
     df["buy_condition"] = (
         (df["trend_score"] >= 2)
         & (df["macd"] > df["macd_signal"])
@@ -470,20 +660,54 @@ def calculate_indicators(data: pd.DataFrame) -> pd.DataFrame:
 def get_analysis(df: pd.DataFrame):
     latest = df.iloc[-1]
 
-    close = safe_float(latest["close"])
-    ema21 = safe_float(latest["ema21"])
-    ema50 = safe_float(latest["ema50"])
-    ema200 = safe_float(latest["ema200"])
-    rsi = safe_float(latest["rsi"])
-    atr = safe_float(latest["atr"])
-    volume_ratio = safe_float(latest["volume_ratio"], 0)
-    trend_score = int(safe_float(latest["trend_score"], 0))
+    close = safe_float(latest.get("close"))
+    ema21 = safe_float(latest.get("ema21"))
+    ema50 = safe_float(latest.get("ema50"))
+    ema200 = safe_float(latest.get("ema200"))
+    rsi = safe_float(latest.get("rsi"), 50)
+    atr = safe_float(latest.get("atr"))
+    volume_ratio = safe_float(
+        latest.get("volume_ratio"),
+        0,
+    )
 
-    bullish_stack = ema21 > ema50 > ema200
-    bearish_stack = ema21 < ema50 < ema200
+    trend_score = int(
+        safe_float(
+            latest.get("trend_score"),
+            0,
+        )
+    )
 
-    macd_bullish = latest["macd"] > latest["macd_signal"]
-    macd_bearish = latest["macd"] < latest["macd_signal"]
+    macd = safe_float(latest.get("macd"))
+    macd_signal = safe_float(
+        latest.get("macd_signal")
+    )
+
+    bullish_stack = (
+        np.isfinite(ema21)
+        and np.isfinite(ema50)
+        and np.isfinite(ema200)
+        and ema21 > ema50 > ema200
+    )
+
+    bearish_stack = (
+        np.isfinite(ema21)
+        and np.isfinite(ema50)
+        and np.isfinite(ema200)
+        and ema21 < ema50 < ema200
+    )
+
+    macd_bullish = (
+        np.isfinite(macd)
+        and np.isfinite(macd_signal)
+        and macd > macd_signal
+    )
+
+    macd_bearish = (
+        np.isfinite(macd)
+        and np.isfinite(macd_signal)
+        and macd < macd_signal
+    )
 
     if bullish_stack and macd_bullish:
         trend = "STRONG BULLISH"
@@ -496,8 +720,13 @@ def get_analysis(df: pd.DataFrame):
     else:
         trend = "NEUTRAL"
 
-    buy_signal = bool(latest["buy_condition"])
-    sell_signal = bool(latest["sell_condition"])
+    buy_signal = bool(
+        latest.get("buy_condition", False)
+    )
+
+    sell_signal = bool(
+        latest.get("sell_condition", False)
+    )
 
     if buy_signal:
         verdict = "BUY BIAS"
@@ -506,7 +735,7 @@ def get_analysis(df: pd.DataFrame):
     else:
         verdict = "WAIT / NEUTRAL"
 
-    if np.isfinite(atr):
+    if np.isfinite(close) and np.isfinite(atr):
         buy_stop = close - atr * 1.5
         buy_target = close + atr * 3.0
         sell_stop = close + atr * 1.5
@@ -531,8 +760,12 @@ def get_analysis(df: pd.DataFrame):
         "buy_target": buy_target,
         "sell_stop": sell_stop,
         "sell_target": sell_target,
-        "bullish_bos": bool(latest["bullish_bos"]),
-        "bearish_bos": bool(latest["bearish_bos"]),
+        "bullish_bos": bool(
+            latest.get("bullish_bos", False)
+        ),
+        "bearish_bos": bool(
+            latest.get("bearish_bos", False)
+        ),
     }
 
 
@@ -542,30 +775,45 @@ def get_analysis(df: pd.DataFrame):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fred_latest(series_id: str):
+    """
+    Gets the latest value from FRED.
+    """
     url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 
     try:
-        data = pd.read_csv(
+        response = requests.get(
             url,
             params={"id": series_id},
             timeout=20,
+        )
+
+        response.raise_for_status()
+
+        data = pd.read_csv(
+            StringIO(response.text)
         )
 
         if data.empty:
             return np.nan, None
 
         value_column = data.columns[-1]
+
         data[value_column] = pd.to_numeric(
             data[value_column],
             errors="coerce",
         )
 
-        data = data.dropna(subset=[value_column])
+        data = data.dropna(
+            subset=[value_column]
+        )
 
         if data.empty:
             return np.nan, None
 
-        latest_value = safe_float(data[value_column].iloc[-1])
+        latest_value = safe_float(
+            data[value_column].iloc[-1]
+        )
+
         latest_date = data.iloc[-1].iloc[0]
 
         return latest_value, latest_date
@@ -578,7 +826,10 @@ def fred_latest(series_id: str):
 # CHART
 # ============================================================
 
-def build_chart(df: pd.DataFrame, symbol: str):
+def build_chart(
+    df: pd.DataFrame,
+    symbol: str,
+):
     chart = make_subplots(
         rows=3,
         cols=1,
@@ -592,6 +843,7 @@ def build_chart(df: pd.DataFrame, symbol: str):
         ],
     )
 
+    # Candlestick chart
     chart.add_trace(
         go.Candlestick(
             x=df.index,
@@ -605,12 +857,16 @@ def build_chart(df: pd.DataFrame, symbol: str):
         col=1,
     )
 
+    # Moving averages
     chart.add_trace(
         go.Scatter(
             x=df.index,
             y=df["ema21"],
             name="EMA 21",
-            line={"color": "yellow", "width": 1},
+            line={
+                "color": "yellow",
+                "width": 1,
+            },
         ),
         row=1,
         col=1,
@@ -621,7 +877,10 @@ def build_chart(df: pd.DataFrame, symbol: str):
             x=df.index,
             y=df["ema50"],
             name="EMA 50",
-            line={"color": "orange", "width": 2},
+            line={
+                "color": "orange",
+                "width": 2,
+            },
         ),
         row=1,
         col=1,
@@ -632,12 +891,16 @@ def build_chart(df: pd.DataFrame, symbol: str):
             x=df.index,
             y=df["ema200"],
             name="EMA 200",
-            line={"color": "white", "width": 2},
+            line={
+                "color": "white",
+                "width": 2,
+            },
         ),
         row=1,
         col=1,
     )
 
+    # Volume colors
     volume_colors = np.where(
         df["close"] >= df["open"],
         "rgba(0,180,80,0.65)",
@@ -660,18 +923,25 @@ def build_chart(df: pd.DataFrame, symbol: str):
             x=df.index,
             y=df["volume_average"],
             name="Volume Average",
-            line={"color": "orange", "width": 1},
+            line={
+                "color": "orange",
+                "width": 1,
+            },
         ),
         row=2,
         col=1,
     )
 
+    # RSI
     chart.add_trace(
         go.Scatter(
             x=df.index,
             y=df["rsi"],
             name="RSI",
-            line={"color": "cyan", "width": 2},
+            line={
+                "color": "cyan",
+                "width": 2,
+            },
         ),
         row=3,
         col=1,
@@ -693,7 +963,10 @@ def build_chart(df: pd.DataFrame, symbol: str):
         col=1,
     )
 
-    buy_points = df[df["buy_condition"]]
+    # Buy signals
+    buy_points = df[
+        df["buy_condition"].fillna(False)
+    ]
 
     if not buy_points.empty:
         chart.add_trace(
@@ -712,7 +985,10 @@ def build_chart(df: pd.DataFrame, symbol: str):
             col=1,
         )
 
-    sell_points = df[df["sell_condition"]]
+    # Sell signals
+    sell_points = df[
+        df["sell_condition"].fillna(False)
+    ]
 
     if not sell_points.empty:
         chart.add_trace(
@@ -736,12 +1012,32 @@ def build_chart(df: pd.DataFrame, symbol: str):
         template="plotly_dark",
         xaxis_rangeslider_visible=False,
         legend_orientation="h",
-        margin={"l": 20, "r": 20, "t": 70, "b": 20},
+        margin={
+            "l": 20,
+            "r": 20,
+            "t": 70,
+            "b": 20,
+        },
     )
 
-    chart.update_yaxes(title_text="Price", row=1, col=1)
-    chart.update_yaxes(title_text="Volume", row=2, col=1)
-    chart.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1)
+    chart.update_yaxes(
+        title_text="Price",
+        row=1,
+        col=1,
+    )
+
+    chart.update_yaxes(
+        title_text="Volume",
+        row=2,
+        col=1,
+    )
+
+    chart.update_yaxes(
+        title_text="RSI",
+        range=[0, 100],
+        row=3,
+        col=1,
+    )
 
     return chart
 
@@ -758,12 +1054,12 @@ default_symbols = [
     "NVDA",
     "SPY",
     "QQQ",
-    "SLV",
     "GLD",
-    "XAGUSD",
+    "SLV",
     "XAUUSD",
-    "SI=F",
+    "XAGUSD",
     "GC=F",
+    "SI=F",
 ]
 
 selected_symbol = st.sidebar.selectbox(
@@ -777,7 +1073,27 @@ custom_symbol = st.sidebar.text_input(
     placeholder="Example: TSLA",
 )
 
-symbol = clean_symbol(custom_symbol or selected_symbol)
+symbol = clean_symbol(
+    custom_symbol or selected_symbol
+)
+
+st.sidebar.markdown("---")
+
+st.sidebar.caption(
+    "API connection status:"
+)
+
+st.sidebar.caption(
+    f"Massive key loaded: "
+    f"{'YES' if MASSIVE_API_KEY else 'NO'}"
+)
+
+st.sidebar.caption(
+    f"GoldAPI key loaded: "
+    f"{'YES' if GOLDAPI_KEY else 'NO'}"
+)
+
+st.sidebar.markdown("---")
 
 auto_refresh = st.sidebar.checkbox(
     "Auto-refresh",
@@ -803,11 +1119,13 @@ if auto_refresh and st_autorefresh is not None:
 # MAIN APPLICATION
 # ============================================================
 
-st.title("Institutional-Style Daily Market Dashboard")
+st.title(
+    "Institutional-Style Market Dashboard"
+)
 
 st.caption(
-    "Rule-based technical, volume, structure, risk, and macro analysis. "
-    "This is decision-support software, not a guarantee of future returns."
+    "Technical, volume, structure, risk, and macro analysis. "
+    "This is decision-support software, not guaranteed financial advice."
 )
 
 quote = load_quote(symbol)
@@ -815,28 +1133,57 @@ history = load_history(symbol)
 
 if quote is None:
     st.error(
-        "No quote data was returned. Check the symbol or configure a live "
-        "market-data provider."
+        "No quote data was returned. "
+        "Check the symbol, API key, or data-provider access."
     )
+
+    with st.expander("Connection checklist"):
+        st.write(
+            f"Selected symbol: `{symbol}`"
+        )
+        st.write(
+            f"Massive key loaded: "
+            f"`{'YES' if MASSIVE_API_KEY else 'NO'}`"
+        )
+        st.write(
+            f"GoldAPI key loaded: "
+            f"`{'YES' if GOLDAPI_KEY else 'NO'}`"
+        )
+        st.write(
+            "For testing Massive, select `AAPL`."
+        )
+        st.write(
+            "For testing GoldAPI, select `XAUUSD` or `XAGUSD`."
+        )
+
     st.stop()
 
 if history is None or history.empty:
     st.error(
-        "No historical data was returned. Check the symbol and data-provider "
-        "permissions."
+        "No historical data was returned. "
+        "Check the symbol or provider permissions."
     )
     st.stop()
 
+# Calculate indicators
 df = calculate_indicators(history)
+
+if df.empty:
+    st.error("The historical dataset is empty.")
+    st.stop()
+
 analysis = get_analysis(df)
 
+# Provider notice
 if quote["delayed"]:
     st.warning(
-        "The current quote is using fallback data and may be delayed. "
-        "Add MASSIVE_API_KEY or GOLDAPI_KEY for live data."
+        "Fallback data is being used and may be delayed. "
+        "Check your API keys and market-data permissions."
     )
 else:
-    st.success(f"Live provider: {quote['source']}")
+    st.success(
+        f"Connected provider: {quote['source']}"
+    )
 
 
 # ============================================================
@@ -848,7 +1195,7 @@ metric_1, metric_2, metric_3, metric_4, metric_5 = st.columns(5)
 metric_1.metric(
     "Last Price",
     f"{quote['price']:,.4f}",
-    f"{quote['change_percent']:+.2f}%",
+    format_percent(quote["change_percent"]),
 )
 
 metric_2.metric(
@@ -873,7 +1220,7 @@ metric_5.metric(
 
 
 # ============================================================
-# SIGNAL PANEL
+# DAILY ANALYSIS
 # ============================================================
 
 st.subheader("Daily Analysis")
@@ -887,17 +1234,23 @@ panel_1.metric(
 
 panel_2.metric(
     "ATR",
-    f"{analysis['atr']:,.4f}",
+    f"{analysis['atr']:,.4f}"
+    if np.isfinite(analysis["atr"])
+    else "Unavailable",
 )
 
 panel_3.metric(
     "Buy Stop Guide",
-    f"{analysis['buy_stop']:,.4f}",
+    f"{analysis['buy_stop']:,.4f}"
+    if np.isfinite(analysis["buy_stop"])
+    else "Unavailable",
 )
 
 panel_4.metric(
     "Buy Target Guide",
-    f"{analysis['buy_target']:,.4f}",
+    f"{analysis['buy_target']:,.4f}"
+    if np.isfinite(analysis["buy_target"])
+    else "Unavailable",
 )
 
 if analysis["buy_signal"]:
@@ -919,13 +1272,16 @@ else:
 # ============================================================
 
 st.plotly_chart(
-    build_chart(df.tail(500), symbol),
+    build_chart(
+        df.tail(500),
+        symbol,
+    ),
     use_container_width=True,
 )
 
 
 # ============================================================
-# MACRO PANEL
+# MACRO DATA
 # ============================================================
 
 st.subheader("Macro Reference Data")
@@ -938,26 +1294,32 @@ fed_funds, fed_funds_date = fred_latest("FEDFUNDS")
 
 macro_1.metric(
     "10Y Treasury Yield",
-    f"{ten_year:.2f}%" if np.isfinite(ten_year) else "Unavailable",
+    f"{ten_year:.2f}%"
+    if np.isfinite(ten_year)
+    else "Unavailable",
 )
 
 macro_2.metric(
     "10Y Real Yield",
-    f"{real_yield:.2f}%" if np.isfinite(real_yield) else "Unavailable",
+    f"{real_yield:.2f}%"
+    if np.isfinite(real_yield)
+    else "Unavailable",
 )
 
 macro_3.metric(
     "Effective Fed Funds",
-    f"{fed_funds:.2f}%" if np.isfinite(fed_funds) else "Unavailable",
+    f"{fed_funds:.2f}%"
+    if np.isfinite(fed_funds)
+    else "Unavailable",
 )
 
 st.caption(
-    "Macro values may be daily or monthly depending on the official series."
+    "Macro values can be daily or monthly depending on the official series."
 )
 
 
 # ============================================================
-# DATA TABLE
+# LATEST CALCULATIONS TABLE
 # ============================================================
 
 with st.expander("View latest calculations"):
@@ -976,10 +1338,13 @@ with st.expander("View latest calculations"):
         "trend_score",
         "macd",
         "macd_signal",
+        "macd_histogram",
     ]
 
     available_columns = [
-        column for column in output_columns if column in df.columns
+        column
+        for column in output_columns
+        if column in df.columns
     ]
 
     st.dataframe(
@@ -988,6 +1353,11 @@ with st.expander("View latest calculations"):
     )
 
 
+# ============================================================
+# FOOTER
+# ============================================================
+
 st.caption(
-    f"Last refresh: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    "Last refresh: "
+    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 )
