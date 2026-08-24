@@ -21,24 +21,29 @@ except ImportError:
 # ============================================================
 
 st.set_page_config(
-    page_title="Market Dashboard",
+    page_title="Institutional Market Dashboard",
     page_icon="📊",
     layout="wide",
 )
 
 
 # ============================================================
-# CONFIGURATION AND API KEYS
+# API CONFIGURATION
 # ============================================================
 
 def read_secret(name: str) -> str:
     """
-    Reads a secret from Streamlit Cloud Secrets first,
-    then from environment variables.
+    Reads a secret from Streamlit Cloud Secrets.
+    Environment variables are used as a backup.
     """
+    value = ""
+
     try:
-        value = st.secrets[name]
+        value = st.secrets.get(name, "")
     except Exception:
+        value = ""
+
+    if not value:
         value = os.getenv(name, "")
 
     return str(value or "").strip().strip('"').strip("'")
@@ -47,7 +52,7 @@ def read_secret(name: str) -> str:
 MASSIVE_API_KEY = read_secret("MASSIVE_API_KEY")
 GOLDAPI_KEY = read_secret("GOLDAPI_KEY")
 
-# Current Massive API base URL
+# Current Massive API URL
 MASSIVE_BASE_URL = "https://api.massive.com"
 
 
@@ -72,7 +77,7 @@ def safe_float(value, default=np.nan):
         return default
 
 
-def format_percent(value) -> str:
+def format_delta(value) -> str:
     value = safe_float(value)
 
     if np.isfinite(value):
@@ -81,20 +86,13 @@ def format_percent(value) -> str:
     return "Unavailable"
 
 
-def yfinance_symbol(symbol: str) -> str:
-    """
-    Converts friendly metal names into Yahoo Finance symbols.
-    """
-    mapping = {
-        "GOLD": "GC=F",
-        "XAU": "GC=F",
-        "XAUUSD": "GC=F",
-        "SILVER": "SI=F",
-        "XAG": "SI=F",
-        "XAGUSD": "SI=F",
-    }
+def format_number(value, decimals=4) -> str:
+    value = safe_float(value)
 
-    return mapping.get(symbol, symbol)
+    if np.isfinite(value):
+        return f"{value:,.{decimals}f}"
+
+    return "Unavailable"
 
 
 def is_precious_metal_spot(symbol: str) -> bool:
@@ -115,10 +113,25 @@ def metal_code(symbol: str) -> str:
     return "XAG"
 
 
+def yfinance_symbol(symbol: str) -> str:
+    """
+    Converts friendly metal symbols into Yahoo Finance futures symbols.
+    """
+    mapping = {
+        "GOLD": "GC=F",
+        "XAU": "GC=F",
+        "XAUUSD": "GC=F",
+        "SILVER": "SI=F",
+        "XAG": "SI=F",
+        "XAGUSD": "SI=F",
+    }
+
+    return mapping.get(symbol, symbol)
+
+
 def normalize_yfinance_columns(data: pd.DataFrame) -> pd.DataFrame:
     """
-    Makes yfinance columns consistent when yfinance returns
-    normal columns or MultiIndex columns.
+    Makes yfinance column names consistent.
     """
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
@@ -132,16 +145,19 @@ def normalize_yfinance_columns(data: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# MASSIVE DATA
+# MASSIVE API
 # ============================================================
 
 @st.cache_data(ttl=15, show_spinner=False)
 def massive_latest_quote(symbol: str, api_key: str):
     """
-    Gets the latest U.S. stock or ETF snapshot from Massive.
+    Gets the latest stock or ETF quote from Massive.
+
+    Returns:
+        quote, status_message
     """
     if not api_key:
-        return None
+        return None, "Massive API key is empty."
 
     symbol = clean_symbol(symbol)
 
@@ -158,10 +174,13 @@ def massive_latest_quote(symbol: str, api_key: str):
         )
 
         if response.status_code != 200:
-            return None
+            return None, f"Massive HTTP {response.status_code}"
 
         payload = response.json()
         ticker = payload.get("ticker") or {}
+
+        if not ticker:
+            return None, "Massive returned no ticker data."
 
         last_trade = ticker.get("lastTrade") or {}
         last_quote = ticker.get("lastQuote") or {}
@@ -181,7 +200,7 @@ def massive_latest_quote(symbol: str, api_key: str):
         previous_close = safe_float(previous_close)
 
         if not np.isfinite(price):
-            return None
+            return None, "Massive returned no usable price."
 
         if np.isfinite(previous_close) and previous_close != 0:
             change = price - previous_close
@@ -190,7 +209,7 @@ def massive_latest_quote(symbol: str, api_key: str):
             change = np.nan
             change_percent = np.nan
 
-        return {
+        quote = {
             "price": price,
             "previous_close": previous_close,
             "change": change,
@@ -200,8 +219,13 @@ def massive_latest_quote(symbol: str, api_key: str):
             "timestamp": datetime.now(timezone.utc),
         }
 
+        return quote, "Massive quote received successfully."
+
+    except requests.RequestException:
+        return None, "Could not connect to Massive."
+
     except Exception:
-        return None
+        return None, "Massive returned an unexpected response."
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -211,10 +235,13 @@ def massive_daily_history(
     api_key: str,
 ):
     """
-    Gets daily historical candles from Massive.
+    Gets daily historical data from Massive.
+
+    Returns:
+        dataframe, status_message
     """
     if not api_key:
-        return None
+        return None, "Massive API key is empty."
 
     symbol = clean_symbol(symbol)
 
@@ -239,13 +266,13 @@ def massive_daily_history(
         )
 
         if response.status_code != 200:
-            return None
+            return None, f"Massive history HTTP {response.status_code}"
 
         payload = response.json()
         results = payload.get("results") or []
 
         if not results:
-            return None
+            return None, "Massive returned no historical data."
 
         rows = []
 
@@ -268,29 +295,41 @@ def massive_daily_history(
         dataframe = pd.DataFrame(rows)
 
         if dataframe.empty:
-            return None
+            return None, "Massive returned an empty dataset."
 
         dataframe = dataframe.dropna(
-            subset=["date", "open", "high", "low", "close"]
+            subset=[
+                "date",
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
         )
 
         dataframe = dataframe.set_index("date")
         dataframe = dataframe.sort_index()
 
-        return dataframe
+        if dataframe.empty:
+            return None, "No usable historical rows were found."
+
+        return dataframe, "Massive history received successfully."
+
+    except requests.RequestException:
+        return None, "Could not connect to Massive history endpoint."
 
     except Exception:
-        return None
+        return None, "Unexpected Massive history response."
 
 
 # ============================================================
-# GOLDAPI DATA
+# GOLDAPI
 # ============================================================
 
 @st.cache_data(ttl=15, show_spinner=False)
 def goldapi_latest_quote(symbol: str, api_key: str):
     """
-    Gets current gold or silver spot prices from GoldAPI.
+    Gets gold or silver spot prices from GoldAPI.
 
     Gold:
         XAU/USD
@@ -299,10 +338,9 @@ def goldapi_latest_quote(symbol: str, api_key: str):
         XAG/USD
     """
     if not api_key:
-        return None
+        return None, "GoldAPI key is empty."
 
     code = metal_code(symbol)
-
     url = f"https://app.goldapi.net/price/{code}/USD"
 
     try:
@@ -313,7 +351,7 @@ def goldapi_latest_quote(symbol: str, api_key: str):
         )
 
         if response.status_code != 200:
-            return None
+            return None, f"GoldAPI HTTP {response.status_code}"
 
         payload = response.json()
 
@@ -322,22 +360,33 @@ def goldapi_latest_quote(symbol: str, api_key: str):
         previous_close = safe_float(
             payload.get("prev_close")
             or payload.get("previous_close")
+            or payload.get("prev_close_price")
         )
 
         if not np.isfinite(price):
-            return None
+            return None, "GoldAPI returned no usable price."
 
-        change = safe_float(payload.get("ch"))
-        change_percent = safe_float(payload.get("chp"))
+        change = safe_float(
+            payload.get("ch")
+            or payload.get("change")
+        )
+
+        change_percent = safe_float(
+            payload.get("chp")
+            or payload.get("change_percent")
+        )
 
         if not np.isfinite(change) and np.isfinite(previous_close):
             change = price - previous_close
 
-        if not np.isfinite(change_percent):
-            if np.isfinite(previous_close) and previous_close != 0:
-                change_percent = change / previous_close * 100
+        if (
+            not np.isfinite(change_percent)
+            and np.isfinite(previous_close)
+            and previous_close != 0
+        ):
+            change_percent = change / previous_close * 100
 
-        return {
+        quote = {
             "price": price,
             "previous_close": previous_close,
             "change": change,
@@ -347,19 +396,88 @@ def goldapi_latest_quote(symbol: str, api_key: str):
             "timestamp": datetime.now(timezone.utc),
         }
 
+        return quote, "GoldAPI quote received successfully."
+
+    except requests.RequestException:
+        return None, "Could not connect to GoldAPI."
+
     except Exception:
-        return None
+        return None, "GoldAPI returned an unexpected response."
 
 
 # ============================================================
-# YAHOO FINANCE FALLBACK DATA
+# YAHOO FINANCE FALLBACK
 # ============================================================
+
+@st.cache_data(ttl=60, show_spinner=False)
+def yfinance_latest_quote(symbol: str):
+    """
+    Gets a fallback quote from Yahoo Finance.
+    Data may be delayed.
+    """
+    yf_symbol = yfinance_symbol(symbol)
+
+    try:
+        data = yf.download(
+            yf_symbol,
+            period="5d",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+
+        if data is None or data.empty:
+            return None, "Yahoo Finance returned no quote."
+
+        data = normalize_yfinance_columns(data)
+
+        if "close" not in data.columns:
+            return None, "Yahoo Finance returned no close price."
+
+        data = data.dropna(subset=["close"])
+
+        if data.empty:
+            return None, "Yahoo Finance returned no usable price."
+
+        price = safe_float(data["close"].iloc[-1])
+
+        if len(data) > 1:
+            previous_close = safe_float(data["close"].iloc[-2])
+        else:
+            previous_close = np.nan
+
+        if (
+            np.isfinite(price)
+            and np.isfinite(previous_close)
+            and previous_close != 0
+        ):
+            change = price - previous_close
+            change_percent = change / previous_close * 100
+        else:
+            change = np.nan
+            change_percent = np.nan
+
+        quote = {
+            "price": price,
+            "previous_close": previous_close,
+            "change": change,
+            "change_percent": change_percent,
+            "source": "Yahoo Finance fallback",
+            "delayed": True,
+            "timestamp": datetime.now(timezone.utc),
+        }
+
+        return quote, "Yahoo Finance fallback is being used."
+
+    except Exception:
+        return None, "Yahoo Finance request failed."
+
 
 @st.cache_data(ttl=60, show_spinner=False)
 def yfinance_history(symbol: str, years: int = 3):
     """
-    Fallback historical data source.
-    Data can be delayed.
+    Gets fallback historical data from Yahoo Finance.
     """
     yf_symbol = yfinance_symbol(symbol)
 
@@ -394,7 +512,12 @@ def yfinance_history(symbol: str, years: int = 3):
         data.index = pd.to_datetime(data.index)
 
         data = data.dropna(
-            subset=["open", "high", "low", "close"]
+            subset=[
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
         )
 
         data = data.sort_index()
@@ -408,69 +531,6 @@ def yfinance_history(symbol: str, years: int = 3):
         return None
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def yfinance_latest_quote(symbol: str):
-    """
-    Fallback latest quote.
-    This data may be delayed.
-    """
-    yf_symbol = yfinance_symbol(symbol)
-
-    try:
-        data = yf.download(
-            yf_symbol,
-            period="5d",
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
-
-        if data is None or data.empty:
-            return None
-
-        data = normalize_yfinance_columns(data)
-
-        if "close" not in data.columns:
-            return None
-
-        data = data.dropna(subset=["close"])
-
-        if data.empty:
-            return None
-
-        price = safe_float(data["close"].iloc[-1])
-
-        if len(data) > 1:
-            previous_close = safe_float(data["close"].iloc[-2])
-        else:
-            previous_close = np.nan
-
-        if (
-            np.isfinite(price)
-            and np.isfinite(previous_close)
-            and previous_close != 0
-        ):
-            change = price - previous_close
-            change_percent = change / previous_close * 100
-        else:
-            change = np.nan
-            change_percent = np.nan
-
-        return {
-            "price": price,
-            "previous_close": previous_close,
-            "change": change,
-            "change_percent": change_percent,
-            "source": "Yahoo Finance fallback",
-            "delayed": True,
-            "timestamp": datetime.now(timezone.utc),
-        }
-
-    except Exception:
-        return None
-
-
 # ============================================================
 # DATA LOADING
 # ============================================================
@@ -478,39 +538,70 @@ def yfinance_latest_quote(symbol: str):
 def load_quote(symbol: str):
     symbol = clean_symbol(symbol)
 
-    # GoldAPI is used for gold/silver spot prices
+    provider_messages = []
+
+    # GoldAPI for gold and silver spot
     if is_precious_metal_spot(symbol):
-        quote = goldapi_latest_quote(symbol, GOLDAPI_KEY)
+        quote, message = goldapi_latest_quote(
+            symbol,
+            GOLDAPI_KEY,
+        )
 
         if quote is not None:
-            return quote
+            return quote, message
 
-    # Massive is used for U.S. stocks and ETFs
-    quote = massive_latest_quote(symbol, MASSIVE_API_KEY)
+        provider_messages.append(message)
+
+    # Massive for stocks and ETFs
+    quote, message = massive_latest_quote(
+        symbol,
+        MASSIVE_API_KEY,
+    )
 
     if quote is not None:
-        return quote
+        return quote, message
 
-    # Fallback
-    return yfinance_latest_quote(symbol)
+    provider_messages.append(message)
+
+    # Yahoo Finance fallback
+    quote, yahoo_message = yfinance_latest_quote(symbol)
+
+    if quote is not None:
+        combined_message = (
+            "Fallback data is being used. "
+            + " | ".join(provider_messages)
+        )
+        return quote, combined_message
+
+    provider_messages.append(yahoo_message)
+
+    return None, " | ".join(provider_messages)
 
 
 def load_history(symbol: str):
     symbol = clean_symbol(symbol)
 
-    # Massive historical data for U.S. stocks and ETFs
+    # Use Massive history for stocks and ETFs
     if not is_precious_metal_spot(symbol):
-        data = massive_daily_history(
+        dataframe, message = massive_daily_history(
             symbol,
             years=3,
             api_key=MASSIVE_API_KEY,
         )
 
-        if data is not None and not data.empty:
-            return data
+        if dataframe is not None and not dataframe.empty:
+            return dataframe, message
 
-    # Fallback history, including gold and silver futures
-    return yfinance_history(symbol, years=3)
+    # Use Yahoo Finance fallback history
+    dataframe = yfinance_history(
+        symbol,
+        years=3,
+    )
+
+    if dataframe is not None and not dataframe.empty:
+        return dataframe, "Yahoo Finance history is being used."
+
+    return None, "No historical data was returned."
 
 
 # ============================================================
@@ -620,7 +711,7 @@ def calculate_indicators(data: pd.DataFrame) -> pd.DataFrame:
         + (df["close"] > df["ema200"]).astype(int)
     )
 
-    # Breakout structure
+    # Recent structure
     df["recent_high"] = (
         df["high"].rolling(20).max().shift(1)
     )
@@ -637,7 +728,7 @@ def calculate_indicators(data: pd.DataFrame) -> pd.DataFrame:
         df["close"] < df["recent_low"]
     )
 
-    # Buy and sell conditions
+    # Buy condition
     df["buy_condition"] = (
         (df["trend_score"] >= 2)
         & (df["macd"] > df["macd_signal"])
@@ -646,6 +737,7 @@ def calculate_indicators(data: pd.DataFrame) -> pd.DataFrame:
         & (df["volume_ratio"] >= 1.5)
     )
 
+    # Sell condition
     df["sell_condition"] = (
         (df["trend_score"] <= 1)
         & (df["macd"] < df["macd_signal"])
@@ -775,9 +867,6 @@ def get_analysis(df: pd.DataFrame):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fred_latest(series_id: str):
-    """
-    Gets the latest value from FRED.
-    """
     url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 
     try:
@@ -843,7 +932,6 @@ def build_chart(
         ],
     )
 
-    # Candlestick chart
     chart.add_trace(
         go.Candlestick(
             x=df.index,
@@ -857,7 +945,6 @@ def build_chart(
         col=1,
     )
 
-    # Moving averages
     chart.add_trace(
         go.Scatter(
             x=df.index,
@@ -900,7 +987,6 @@ def build_chart(
         col=1,
     )
 
-    # Volume colors
     volume_colors = np.where(
         df["close"] >= df["open"],
         "rgba(0,180,80,0.65)",
@@ -932,7 +1018,6 @@ def build_chart(
         col=1,
     )
 
-    # RSI
     chart.add_trace(
         go.Scatter(
             x=df.index,
@@ -963,7 +1048,6 @@ def build_chart(
         col=1,
     )
 
-    # Buy signals
     buy_points = df[
         df["buy_condition"].fillna(False)
     ]
@@ -985,7 +1069,6 @@ def build_chart(
             col=1,
         )
 
-    # Sell signals
     sell_points = df[
         df["sell_condition"].fillna(False)
     ]
@@ -1079,16 +1162,14 @@ symbol = clean_symbol(
 
 st.sidebar.markdown("---")
 
-st.sidebar.caption(
-    "API connection status:"
-)
+st.sidebar.caption("API connection status")
 
-st.sidebar.caption(
+st.sidebar.write(
     f"Massive key loaded: "
     f"{'YES' if MASSIVE_API_KEY else 'NO'}"
 )
 
-st.sidebar.caption(
+st.sidebar.write(
     f"GoldAPI key loaded: "
     f"{'YES' if GOLDAPI_KEY else 'NO'}"
 )
@@ -1119,28 +1200,25 @@ if auto_refresh and st_autorefresh is not None:
 # MAIN APPLICATION
 # ============================================================
 
-st.title(
-    "Institutional-Style Market Dashboard"
-)
+st.title("Institutional-Style Market Dashboard")
 
 st.caption(
     "Technical, volume, structure, risk, and macro analysis. "
     "This is decision-support software, not guaranteed financial advice."
 )
 
-quote = load_quote(symbol)
-history = load_history(symbol)
+quote, quote_status = load_quote(symbol)
+history, history_status = load_history(symbol)
 
 if quote is None:
     st.error(
-        "No quote data was returned. "
-        "Check the symbol, API key, or data-provider access."
+        "No quote data was returned."
     )
 
-    with st.expander("Connection checklist"):
-        st.write(
-            f"Selected symbol: `{symbol}`"
-        )
+    st.info(quote_status)
+
+    with st.expander("Connection details"):
+        st.write(f"Selected symbol: `{symbol}`")
         st.write(
             f"Massive key loaded: "
             f"`{'YES' if MASSIVE_API_KEY else 'NO'}`"
@@ -1149,23 +1227,25 @@ if quote is None:
             f"GoldAPI key loaded: "
             f"`{'YES' if GOLDAPI_KEY else 'NO'}`"
         )
-        st.write(
-            "For testing Massive, select `AAPL`."
-        )
-        st.write(
-            "For testing GoldAPI, select `XAUUSD` or `XAGUSD`."
-        )
+        st.write(f"Quote status: `{quote_status}`")
+        st.write(f"History status: `{history_status}`")
 
     st.stop()
 
 if history is None or history.empty:
     st.error(
-        "No historical data was returned. "
-        "Check the symbol or provider permissions."
+        "No historical data was returned."
     )
+
+    st.info(history_status)
+
+    with st.expander("Connection details"):
+        st.write(f"Selected symbol: `{symbol}`")
+        st.write(f"Quote status: `{quote_status}`")
+        st.write(f"History status: `{history_status}`")
+
     st.stop()
 
-# Calculate indicators
 df = calculate_indicators(history)
 
 if df.empty:
@@ -1174,12 +1254,8 @@ if df.empty:
 
 analysis = get_analysis(df)
 
-# Provider notice
 if quote["delayed"]:
-    st.warning(
-        "Fallback data is being used and may be delayed. "
-        "Check your API keys and market-data permissions."
-    )
+    st.warning(quote_status)
 else:
     st.success(
         f"Connected provider: {quote['source']}"
@@ -1194,8 +1270,8 @@ metric_1, metric_2, metric_3, metric_4, metric_5 = st.columns(5)
 
 metric_1.metric(
     "Last Price",
-    f"{quote['price']:,.4f}",
-    format_percent(quote["change_percent"]),
+    format_number(quote["price"]),
+    format_delta(quote["change_percent"]),
 )
 
 metric_2.metric(
@@ -1210,7 +1286,7 @@ metric_3.metric(
 
 metric_4.metric(
     "RSI",
-    f"{analysis['rsi']:.1f}",
+    format_number(analysis["rsi"], 1),
 )
 
 metric_5.metric(
@@ -1234,23 +1310,17 @@ panel_1.metric(
 
 panel_2.metric(
     "ATR",
-    f"{analysis['atr']:,.4f}"
-    if np.isfinite(analysis["atr"])
-    else "Unavailable",
+    format_number(analysis["atr"]),
 )
 
 panel_3.metric(
     "Buy Stop Guide",
-    f"{analysis['buy_stop']:,.4f}"
-    if np.isfinite(analysis["buy_stop"])
-    else "Unavailable",
+    format_number(analysis["buy_stop"]),
 )
 
 panel_4.metric(
     "Buy Target Guide",
-    f"{analysis['buy_target']:,.4f}"
-    if np.isfinite(analysis["buy_target"])
-    else "Unavailable",
+    format_number(analysis["buy_target"]),
 )
 
 if analysis["buy_signal"]:
@@ -1319,7 +1389,7 @@ st.caption(
 
 
 # ============================================================
-# LATEST CALCULATIONS TABLE
+# CALCULATIONS TABLE
 # ============================================================
 
 with st.expander("View latest calculations"):
@@ -1352,10 +1422,6 @@ with st.expander("View latest calculations"):
         use_container_width=True,
     )
 
-
-# ============================================================
-# FOOTER
-# ============================================================
 
 st.caption(
     "Last refresh: "
